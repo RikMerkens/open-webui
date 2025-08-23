@@ -16,6 +16,7 @@ from fastapi import (
     HTTPException,
     Request,
     UploadFile,
+    BackgroundTasks
 )
 
 from open_webui.config import CACHE_DIR
@@ -478,10 +479,11 @@ def upload_image(request, image_data, content_type, metadata, user):
     )
     file_item = upload_file_handler(
         request,
-        file=file,
-        metadata=metadata,
-        process=False,
-        user=user,
+        file,
+        metadata,
+        False,
+        user,
+        BackgroundTasks(),
     )
     url = request.app.url_path_for("get_file_content_by_id", id=file_item.id)
     return url
@@ -524,6 +526,16 @@ async def image_generations(
                 headers["X-OpenWebUI-User-Email"] = user.email
                 headers["X-OpenWebUI-User-Role"] = user.role
 
+            base_url = request.app.state.config.IMAGES_OPENAI_API_BASE_URL
+            is_azure = "openai.azure.com" in base_url
+
+            # Optional: use OPENAI_API_CONFIGS to fetch Azure-specific config
+            api_config = request.app.state.config.OPENAI_API_CONFIGS.get(base_url, {})
+            api_version = api_config.get("api_version", None)
+            # Fallback default for Azure if not explicitly provided and not already in base_url
+            if is_azure and not api_version and "api-version=" not in base_url:
+                api_version = "2025-04-01-preview"
+
             data = {
                 "model": (
                     request.app.state.config.IMAGE_GENERATION_MODEL
@@ -535,19 +547,47 @@ async def image_generations(
                 "size": (
                     form_data.size
                     if form_data.size
-                    else request.app.state.config.IMAGE_SIZE
+                    else (request.app.state.config.IMAGE_SIZE or f"{width}x{height}")
                 ),
                 **(
                     {}
-                    if "gpt-image-1" in request.app.state.config.IMAGE_GENERATION_MODEL
+                    if "gpt-image-1" in (request.app.state.config.IMAGE_GENERATION_MODEL or "")
                     else {"response_format": "b64_json"}
                 ),
             }
 
+            if "/images/generations" in base_url:
+                url = base_url
+            elif is_azure:
+                # Azure: use deployment path and api-version
+                deployment = (
+                    (form_data.model if hasattr(form_data, "model") else None)
+                    or request.app.state.config.IMAGE_GENERATION_MODEL
+                    or ""
+                )
+                if not deployment:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Image model must be set to the Azure deployment name.",
+                    )
+
+                url = f"{base_url.rstrip('/')}/openai/deployments/{deployment}/images/generations"
+                if api_version and "api-version=" not in url:
+                    url = f"{url}{'&' if '?' in url else '?'}api-version={api_version}"
+
+                # Azure uses api-key instead of Bearer token; do not send model/response_format in body
+                headers.pop("Authorization", None)
+                headers["api-key"] = request.app.state.config.IMAGES_OPENAI_API_KEY
+                data.pop("model", None)
+                data.pop("response_format", None)
+            else:
+                # Standard OpenAI
+                url = f"{base_url.rstrip('/')}/images/generations"
+
             # Use asyncio.to_thread for the requests.post call
             r = await asyncio.to_thread(
                 requests.post,
-                url=f"{request.app.state.config.IMAGES_OPENAI_API_BASE_URL}/images/generations",
+                url=url,
                 json=data,
                 headers=headers,
             )
