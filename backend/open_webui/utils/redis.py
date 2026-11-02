@@ -11,11 +11,12 @@ import inspect
 import logging
 import time
 from typing import Any
-from urllib.parse import ParseResult, urlparse
+from urllib.parse import ParseResult, urlparse, urlunparse
 
 import redis as _redis_sync
 from open_webui.env import (
     REDIS_CLUSTER,
+    REDIS_ENABLE_AZURE_ENTRA_AUTH,
     REDIS_HEALTH_CHECK_INTERVAL,
     REDIS_RECONNECT_DELAY,
     REDIS_SENTINEL_HOSTS,
@@ -55,6 +56,32 @@ def parse_redis_url(url: str) -> dict[str, Any]:
 
 
 parse_redis_service_url = parse_redis_url
+
+
+def _azure_cluster_address_remap(public_host: str, public_port: int):
+    """Send every cluster node to the public Azure endpoint.
+
+    Azure Managed Redis CLUSTER SLOTS returns IP addresses. The TLS certificate is
+    issued for the public hostname, and the reachable port is the URL port.
+    """
+
+    def remap(address: tuple[str, int]) -> tuple[str, int]:
+        return public_host, public_port
+
+    return remap
+
+
+def redis_url_for_entra(url: str) -> str:
+    """Drop URL credentials when Azure Entra authentication supplies them."""
+    if not url or not REDIS_ENABLE_AZURE_ENTRA_AUTH:
+        return url
+    parts = urlparse(url)
+    if parts.username or parts.password:
+        log.info('Ignoring username and password in the Redis URL because Azure Entra authentication is enabled')
+    hostname = parts.hostname or ''
+    host = f'[{hostname}]' if ':' in hostname else hostname
+    netloc = f'{host}:{parts.port}' if parts.port else host
+    return urlunparse((parts.scheme, netloc, parts.path, '', parts.query, ''))
 
 
 def get_sentinels_from_env(
@@ -109,7 +136,10 @@ def get_redis_client(async_mode: bool = False) -> Any | None:
             async_mode=async_mode,
         )
     except Exception:
-        log.debug('Could not establish Redis connection', exc_info=True)
+        if REDIS_ENABLE_AZURE_ENTRA_AUTH:
+            log.exception('Could not establish Redis connection with Azure Entra authentication')
+        else:
+            log.debug('Could not establish Redis connection', exc_info=True)
         return None
 
 
@@ -281,21 +311,28 @@ def _build_sentinel(
     sentinels: list[tuple[str, int]],
     decode_responses: bool,
     async_mode: bool,
+    credential_provider: Any | None = None,
 ) -> SentinelRedisProxy:
     """Create a SentinelRedisProxy from a redis URL and sentinel list."""
     cfg = parse_redis_url(url)
+    connection_kwargs: dict[str, Any] = {
+        'port': cfg['port'],
+        'db': cfg['db'],
+        'decode_responses': decode_responses,
+        'socket_connect_timeout': REDIS_SOCKET_CONNECT_TIMEOUT,
+        **{k: v for k, v in _socket_options().items() if k != 'socket_connect_timeout'},
+    }
+    if credential_provider is not None:
+        connection_kwargs['credential_provider'] = credential_provider
+    else:
+        connection_kwargs['username'] = cfg['username']
+        connection_kwargs['password'] = cfg['password']
     sentinel = redis_module.sentinel.Sentinel(
         sentinels,
-        port=cfg['port'],
-        db=cfg['db'],
-        username=cfg['username'],
-        password=cfg['password'],
         sentinel_kwargs=build_sentinel_kwargs(
             url, {'socket_connect_timeout': REDIS_SOCKET_CONNECT_TIMEOUT, **_socket_options()}
         ),
-        decode_responses=decode_responses,
-        socket_connect_timeout=REDIS_SOCKET_CONNECT_TIMEOUT,
-        **{k: v for k, v in _socket_options().items() if k != 'socket_connect_timeout'},
+        **connection_kwargs,
     )
     return SentinelRedisProxy(sentinel, cfg['service'], async_mode=async_mode)
 
@@ -326,6 +363,12 @@ def get_redis_connection(
 
     extra = _socket_options()
     connection: Any = None
+    from open_webui.utils.azure_credential import azure_redis_credential_provider
+
+    provider = azure_redis_credential_provider()
+    if provider is not None:
+        extra['credential_provider'] = provider
+    connect_url = redis_url_for_entra(redis_url) if provider is not None and redis_url else redis_url
 
     # Pick the right redis module for sync vs async.
     if async_mode:
@@ -334,20 +377,34 @@ def get_redis_connection(
         import redis as redis_mod  # type: ignore[no-redef]
 
     if redis_sentinels:
-        connection = _build_sentinel(redis_mod, redis_url, redis_sentinels, decode_responses, async_mode)
-    elif redis_cluster:
-        if not redis_url:
-            raise ValueError('Redis URL is required for cluster mode.')
-        connection = redis_mod.cluster.RedisCluster.from_url(
+        connection = _build_sentinel(
+            redis_mod,
             redis_url,
-            decode_responses=decode_responses,
-            **extra,
+            redis_sentinels,
+            decode_responses,
+            async_mode,
+            credential_provider=provider,
         )
-    elif redis_url:
+    elif redis_cluster:
+        if not connect_url:
+            raise ValueError('Redis URL is required for cluster mode.')
+        cluster_kwargs = dict(extra)
+        if provider is not None:
+            parts = urlparse(connect_url)
+            cluster_kwargs['address_remap'] = _azure_cluster_address_remap(
+                parts.hostname or '',
+                parts.port or 10000,
+            )
+        connection = redis_mod.cluster.RedisCluster.from_url(
+            connect_url,
+            decode_responses=decode_responses,
+            **cluster_kwargs,
+        )
+    elif connect_url:
         factory = getattr(redis_mod, 'from_url', None) or redis_mod.Redis.from_url
         # reconnect once when Redis has closed a pooled connection, e.g. after a restart
         retry = redis_mod.retry.Retry(_redis_sync.backoff.NoBackoff(), 1, supported_errors=(redis_mod.ConnectionError,))
-        connection = factory(redis_url, decode_responses=decode_responses, retry=retry, **extra)
+        connection = factory(connect_url, decode_responses=decode_responses, retry=retry, **extra)
 
     _CONNECTION_POOL[cache_key] = connection
     return connection

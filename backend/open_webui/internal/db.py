@@ -11,6 +11,7 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from open_webui.env import (
+    DATABASE_ENABLE_AZURE_ENTRA_AUTH,
     DATABASE_ENABLE_IAM_TOKEN_AUTH,
     DATABASE_ENABLE_SESSION_SHARING,
     DATABASE_ENABLE_SQLITE_WAL,
@@ -153,6 +154,10 @@ if USE_SLIM:
         raise ValueError(
             'AWS RDS IAM authentication requires the standard image. Slim supports PostgreSQL database credentials.'
         )
+    if DATABASE_ENABLE_AZURE_ENTRA_AUTH:
+        raise ValueError(
+            'Azure Entra authentication requires the standard image. Slim supports PostgreSQL database credentials.'
+        )
 
 
 # Normalize SSL params from the URL once; the sync engine needs them
@@ -206,23 +211,58 @@ class RDSIAMTokenAuth:
 _rds_iam_token_auth = RDSIAMTokenAuth(SQLALCHEMY_DATABASE_URL) if DATABASE_ENABLE_IAM_TOKEN_AUTH else None
 
 
+class AzureEntraTokenAuth:
+    """Use a Microsoft Entra access token as the PostgreSQL password.
+
+    Azure Database for PostgreSQL validates the token at login. Existing
+    connections stay valid after the token expires; new connections call
+    ``get_password`` and receive a token that is refreshed five minutes early.
+    """
+
+    def __init__(self, database_url: str) -> None:
+        url = make_url(database_url)
+        if not url.drivername.startswith(('postgresql', 'postgres')):
+            raise ValueError('DATABASE_ENABLE_AZURE_ENTRA_AUTH is only supported for PostgreSQL databases')
+        if not url.host or not url.username:
+            raise ValueError('DATABASE_ENABLE_AZURE_ENTRA_AUTH requires a database host and user')
+
+        self.host = url.host
+        self.port = url.port or 5432
+        self.username = url.username
+
+    def get_password(self) -> str:
+        from open_webui.utils.azure_credential import POSTGRES_TOKEN_SCOPE, get_azure_access_token
+
+        return get_azure_access_token(POSTGRES_TOKEN_SCOPE).token
+
+
+_azure_entra_token_auth = AzureEntraTokenAuth(SQLALCHEMY_DATABASE_URL) if DATABASE_ENABLE_AZURE_ENTRA_AUTH else None
+
+
+def _token_auth():
+    return _rds_iam_token_auth or _azure_entra_token_auth
+
+
 def _set_iam_token_password(dialect, conn_rec, cargs, cparams):
-    if _rds_iam_token_auth is not None:
-        cparams['password'] = _rds_iam_token_auth.get_password()
+    auth = _token_auth()
+    if auth is not None:
+        cparams['password'] = auth.get_password()
 
 
 def enable_iam_token_auth(connectable) -> None:
-    if _rds_iam_token_auth is None:
+    auth = _token_auth()
+    if auth is None:
         return
 
     engine = getattr(connectable, 'sync_engine', connectable)
     url = engine.url
-    auth = _rds_iam_token_auth
     # The token is bound to one host/port/user pair; leave other databases on their own credentials.
     if (url.host, url.port or 5432, url.username) != (auth.host, auth.port, auth.username):
+        kind = 'AWS RDS IAM' if _rds_iam_token_auth is not None else 'Azure Entra'
         log.warning(
-            'AWS RDS IAM token auth not applied to %s: the token is issued for %s@%s:%s, '
+            '%s token auth not applied to %s: the token is issued for %s@%s:%s, '
             'so this connection uses the password from its own URL',
+            kind,
             url.render_as_string(hide_password=True),
             auth.username,
             auth.host,

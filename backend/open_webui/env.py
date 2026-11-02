@@ -302,6 +302,14 @@ if 'postgres://' in DATABASE_URL:
 
 DATABASE_SCHEMA = os.getenv('DATABASE_SCHEMA', None)
 DATABASE_ENABLE_IAM_TOKEN_AUTH = os.getenv('DATABASE_ENABLE_IAM_TOKEN_AUTH', 'False').lower() == 'true'
+# Microsoft Entra token as the PostgreSQL password. The DATABASE_URL user is the
+# Entra principal name (a user UPN or a managed identity name). Mutually exclusive
+# with DATABASE_ENABLE_IAM_TOKEN_AUTH. Uses azure-identity; on the slim image this
+# flag is rejected at startup.
+DATABASE_ENABLE_AZURE_ENTRA_AUTH = os.getenv('DATABASE_ENABLE_AZURE_ENTRA_AUTH', 'False').lower() == 'true'
+
+if DATABASE_ENABLE_IAM_TOKEN_AUTH and DATABASE_ENABLE_AZURE_ENTRA_AUTH:
+    raise ValueError('DATABASE_ENABLE_IAM_TOKEN_AUTH and DATABASE_ENABLE_AZURE_ENTRA_AUTH cannot both be enabled')
 
 _pool_size_raw = os.getenv('DATABASE_POOL_SIZE')
 try:
@@ -380,6 +388,12 @@ RAG_SOURCE_METADATA_KEYS = [key.strip() for key in os.getenv('RAG_SOURCE_METADAT
 
 REDIS_URL = os.getenv('REDIS_URL', '')
 REDIS_CLUSTER = os.getenv('REDIS_CLUSTER', 'False').lower() == 'true'
+# Microsoft Entra authentication for Azure Managed Redis and Azure Cache for Redis.
+# REDIS_URL should be rediss://host:port/0 with no password. The Redis username is
+# the access token oid. A user-assigned identity is selected with AZURE_CLIENT_ID.
+# Cluster mode remaps discovered node addresses to this host and port because Azure
+# Managed Redis advertises IP addresses whose TLS certificate does not match.
+REDIS_ENABLE_AZURE_ENTRA_AUTH = os.getenv('REDIS_ENABLE_AZURE_ENTRA_AUTH', 'False').lower() == 'true'
 
 REDIS_KEY_PREFIX = os.getenv('REDIS_KEY_PREFIX', 'open-webui')
 

@@ -19,6 +19,7 @@ from open_webui.config import (
 from open_webui.env import (
     ENABLE_WEBSOCKET_SUPPORT,
     GLOBAL_LOG_LEVEL,
+    REDIS_ENABLE_AZURE_ENTRA_AUTH,
     REDIS_KEY_PREFIX,
     WEBSOCKET_EVENT_CALLER_TIMEOUT,
     WEBSOCKET_HEARTBEAT_INTERVAL,
@@ -64,6 +65,7 @@ from open_webui.utils.redis import (
     build_sentinel_url,
     get_redis_connection,
     get_sentinels_from_env,
+    redis_url_for_entra,
 )
 from redis.exceptions import RedisError
 from socketio.packet import Packet
@@ -100,6 +102,11 @@ class JSONOnlyPacket(Packet):
 
 
 if WEBSOCKET_MANAGER == 'redis':
+    if REDIS_ENABLE_AZURE_ENTRA_AUTH and WEBSOCKET_REDIS_CLUSTER:
+        raise RuntimeError(
+            'WEBSOCKET_MANAGER=redis cannot use Azure Entra authentication with Redis Cluster. '
+            'The Socket.IO Redis manager does not support Redis Cluster.'
+        )
     sentinel_hosts = WEBSOCKET_SENTINEL_HOSTS or ''
     ws_redis_url = (
         build_sentinel_url(WEBSOCKET_REDIS_URL, sentinel_hosts, WEBSOCKET_SENTINEL_PORT)
@@ -112,8 +119,13 @@ if WEBSOCKET_MANAGER == 'redis':
             **WEBSOCKET_REDIS_OPTIONS,
         }
         if sentinel_hosts
-        else WEBSOCKET_REDIS_OPTIONS
+        else dict(WEBSOCKET_REDIS_OPTIONS)
     )
+    if REDIS_ENABLE_AZURE_ENTRA_AUTH:
+        from open_webui.utils.azure_credential import azure_redis_credential_provider
+
+        ws_redis_url = redis_url_for_entra(ws_redis_url) if not sentinel_hosts else ws_redis_url
+        ws_redis_options['credential_provider'] = azure_redis_credential_provider()
     manager_class = AsyncRedisRoomChannelManager if WEBSOCKET_REDIS_ROOM_CHANNELS else socketio.AsyncRedisManager
     redis_manager = manager_class(ws_redis_url, redis_options=ws_redis_options, json=SOCKETIO_JSON)
     sio = socketio.AsyncServer(

@@ -108,6 +108,8 @@ from open_webui.env import (
     LOG_FORMAT,
     MAX_BODY_LOG_SIZE,
     # Redis
+    REDIS_CLUSTER,
+    REDIS_ENABLE_AZURE_ENTRA_AUTH,
     REDIS_KEY_PREFIX,
     REDIS_TASK_TTL,
     REDIS_URL,
@@ -412,6 +414,11 @@ async def lifespan(app: FastAPI):
     await install_tool_and_function_dependencies()
 
     app.state.redis = get_redis_client(async_mode=True)
+    if REDIS_ENABLE_AZURE_ENTRA_AUTH:
+        if app.state.redis is None:
+            raise RuntimeError('REDIS_ENABLE_AZURE_ENTRA_AUTH is enabled, but the Redis client was not created')
+        await app.state.redis.ping()
+        log.info('Connected to Redis with Azure Entra authentication')
     from open_webui.socket.apps import connections as app_connections
 
     await app_connections.start(app.state.redis)
@@ -2763,10 +2770,19 @@ async def get_current_usage(user=Depends(get_verified_user)):
 
 try:
     if ENABLE_STAR_SESSIONS_MIDDLEWARE:
-        redis_session_store = RedisStore(
-            url=REDIS_URL,
-            prefix=(f'{REDIS_KEY_PREFIX}:session:' if REDIS_KEY_PREFIX else 'session:'),
-        )
+        session_prefix = f'{REDIS_KEY_PREFIX}:session:' if REDIS_KEY_PREFIX else 'session:'
+        if REDIS_ENABLE_AZURE_ENTRA_AUTH:
+            from open_webui.utils.redis import get_redis_connection
+
+            redis_session_store = RedisStore(
+                connection=get_redis_connection(REDIS_URL, redis_cluster=REDIS_CLUSTER, async_mode=True),
+                prefix=session_prefix,
+            )
+        else:
+            redis_session_store = RedisStore(
+                url=REDIS_URL,
+                prefix=session_prefix,
+            )
 
         app.add_middleware(SessionAutoloadMiddleware)
         app.add_middleware(
@@ -2780,6 +2796,8 @@ try:
     else:
         raise ValueError('No Redis URL provided')
 except Exception as e:
+    if ENABLE_STAR_SESSIONS_MIDDLEWARE and REDIS_ENABLE_AZURE_ENTRA_AUTH:
+        log.exception('Redis session store could not use Azure Entra authentication: %s', e)
     app.add_middleware(
         SessionMiddleware,
         secret_key=WEBUI_SECRET_KEY,
