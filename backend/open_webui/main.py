@@ -413,11 +413,28 @@ async def lifespan(app: FastAPI):
     log.info('Installing external dependencies of functions and tools...')
     await install_tool_and_function_dependencies()
 
+    if REDIS_ENABLE_AZURE_ENTRA_AUTH:
+        from open_webui.utils.azure_credential import REDIS_TOKEN_SCOPE, get_azure_access_token
+
+        # Fetch off the event loop so cluster startup and the first PING reuse the cache.
+        await asyncio.to_thread(get_azure_access_token, REDIS_TOKEN_SCOPE)
+
     app.state.redis = get_redis_client(async_mode=True)
     if REDIS_ENABLE_AZURE_ENTRA_AUTH:
         if app.state.redis is None:
-            raise RuntimeError('REDIS_ENABLE_AZURE_ENTRA_AUTH is enabled, but the Redis client was not created')
-        await app.state.redis.ping()
+            raise RuntimeError(
+                'REDIS_ENABLE_AZURE_ENTRA_AUTH is enabled, but the Redis client was not created. '
+                'Startup stops because Entra authentication is required. '
+                'Without this flag, an unreachable Redis server does not stop startup.'
+            )
+        try:
+            await app.state.redis.ping()
+        except Exception as exc:
+            raise RuntimeError(
+                'REDIS_ENABLE_AZURE_ENTRA_AUTH is enabled, but Redis did not respond to PING. '
+                'Startup stops because Entra authentication is required. '
+                'Without this flag, an unreachable Redis server does not stop startup.'
+            ) from exc
         log.info('Connected to Redis with Azure Entra authentication')
     from open_webui.socket.apps import connections as app_connections
 

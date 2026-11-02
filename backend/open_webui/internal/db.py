@@ -154,10 +154,6 @@ if USE_SLIM:
         raise ValueError(
             'AWS RDS IAM authentication requires the standard image. Slim supports PostgreSQL database credentials.'
         )
-    if DATABASE_ENABLE_AZURE_ENTRA_AUTH:
-        raise ValueError(
-            'Azure Entra authentication requires the standard image. Slim supports PostgreSQL database credentials.'
-        )
 
 
 # Normalize SSL params from the URL once; the sync engine needs them
@@ -215,8 +211,9 @@ class AzureEntraTokenAuth:
     """Use a Microsoft Entra access token as the PostgreSQL password.
 
     Azure Database for PostgreSQL validates the token at login. Existing
-    connections stay valid after the token expires; new connections call
-    ``get_password`` and receive a token that is refreshed five minutes early.
+    connections stay valid after the token expires. ``get_password`` reads the
+    shared cache, which a background thread refreshes five minutes early, so a
+    new connection does not call Azure on the event loop.
     """
 
     def __init__(self, database_url: str) -> None:
@@ -230,6 +227,17 @@ class AzureEntraTokenAuth:
         self.port = url.port or 5432
         self.username = url.username
 
+    def warm(self) -> None:
+        """Fetch the first token before the process is serving requests."""
+        from open_webui.utils.azure_credential import (
+            POSTGRES_TOKEN_SCOPE,
+            ensure_azure_token_refresh,
+            fetch_azure_access_token,
+        )
+
+        fetch_azure_access_token(POSTGRES_TOKEN_SCOPE)
+        ensure_azure_token_refresh(POSTGRES_TOKEN_SCOPE)
+
     def get_password(self) -> str:
         from open_webui.utils.azure_credential import POSTGRES_TOKEN_SCOPE, get_azure_access_token
 
@@ -237,6 +245,8 @@ class AzureEntraTokenAuth:
 
 
 _azure_entra_token_auth = AzureEntraTokenAuth(SQLALCHEMY_DATABASE_URL) if DATABASE_ENABLE_AZURE_ENTRA_AUTH else None
+if _azure_entra_token_auth is not None:
+    _azure_entra_token_auth.warm()
 
 
 def _token_auth():

@@ -16,6 +16,7 @@ from urllib.parse import ParseResult, urlparse, urlunparse
 import redis as _redis_sync
 from open_webui.env import (
     REDIS_CLUSTER,
+    REDIS_CLUSTER_REMAP_HOSTNAME,
     REDIS_ENABLE_AZURE_ENTRA_AUTH,
     REDIS_HEALTH_CHECK_INTERVAL,
     REDIS_RECONNECT_DELAY,
@@ -58,17 +59,32 @@ def parse_redis_url(url: str) -> dict[str, Any]:
 parse_redis_service_url = parse_redis_url
 
 
-def _azure_cluster_address_remap(public_host: str, public_port: int):
-    """Send every cluster node to the public Azure endpoint.
+def cluster_hostname_remap(public_host: str):
+    """Replace a discovered cluster hostname and keep that shard's port.
 
-    Azure Managed Redis CLUSTER SLOTS returns IP addresses. The TLS certificate is
-    issued for the public hostname, and the reachable port is the URL port.
+    Azure Managed Redis CLUSTER SLOTS returns node IP addresses. The TLS certificate
+    is issued for the public hostname. Each shard keeps the port the cluster
+    reported (port 10000 is only the first connection point).
     """
 
     def remap(address: tuple[str, int]) -> tuple[str, int]:
-        return public_host, public_port
+        return public_host, address[1]
 
     return remap
+
+
+def redis_options_without_credentials(options: dict[str, Any]) -> dict[str, Any]:
+    """Drop username and password so they are not combined with a credential provider."""
+    cleaned = dict(options)
+    cleaned.pop('username', None)
+    cleaned.pop('password', None)
+    sentinel_kwargs = cleaned.get('sentinel_kwargs')
+    if isinstance(sentinel_kwargs, dict):
+        sentinel_kwargs = dict(sentinel_kwargs)
+        sentinel_kwargs.pop('username', None)
+        sentinel_kwargs.pop('password', None)
+        cleaned['sentinel_kwargs'] = sentinel_kwargs
+    return cleaned
 
 
 def redis_url_for_entra(url: str) -> str:
@@ -389,12 +405,12 @@ def get_redis_connection(
         if not connect_url:
             raise ValueError('Redis URL is required for cluster mode.')
         cluster_kwargs = dict(extra)
-        if provider is not None:
+        if REDIS_CLUSTER_REMAP_HOSTNAME:
             parts = urlparse(connect_url)
-            cluster_kwargs['address_remap'] = _azure_cluster_address_remap(
-                parts.hostname or '',
-                parts.port or 10000,
-            )
+            if parts.hostname:
+                cluster_kwargs['address_remap'] = cluster_hostname_remap(parts.hostname)
+            else:
+                log.warning('REDIS_CLUSTER_REMAP_HOSTNAME is set, but the Redis URL has no hostname')
         connection = redis_mod.cluster.RedisCluster.from_url(
             connect_url,
             decode_responses=decode_responses,

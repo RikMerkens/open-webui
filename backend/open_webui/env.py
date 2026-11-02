@@ -304,8 +304,8 @@ DATABASE_SCHEMA = os.getenv('DATABASE_SCHEMA', None)
 DATABASE_ENABLE_IAM_TOKEN_AUTH = os.getenv('DATABASE_ENABLE_IAM_TOKEN_AUTH', 'False').lower() == 'true'
 # Microsoft Entra token as the PostgreSQL password. The DATABASE_URL user is the
 # Entra principal name (a user UPN or a managed identity name). Mutually exclusive
-# with DATABASE_ENABLE_IAM_TOKEN_AUTH. Uses azure-identity; on the slim image this
-# flag is rejected at startup.
+# with DATABASE_ENABLE_IAM_TOKEN_AUTH. azure-identity is already installed on the
+# standard and slim images.
 DATABASE_ENABLE_AZURE_ENTRA_AUTH = os.getenv('DATABASE_ENABLE_AZURE_ENTRA_AUTH', 'False').lower() == 'true'
 
 if DATABASE_ENABLE_IAM_TOKEN_AUTH and DATABASE_ENABLE_AZURE_ENTRA_AUTH:
@@ -391,9 +391,15 @@ REDIS_CLUSTER = os.getenv('REDIS_CLUSTER', 'False').lower() == 'true'
 # Microsoft Entra authentication for Azure Managed Redis and Azure Cache for Redis.
 # REDIS_URL should be rediss://host:port/0 with no password. The Redis username is
 # the access token oid. A user-assigned identity is selected with AZURE_CLIENT_ID.
-# Cluster mode remaps discovered node addresses to this host and port because Azure
-# Managed Redis advertises IP addresses whose TLS certificate does not match.
+# With this flag, startup stops if the Redis client cannot be created or PING fails.
+# Without it, an unreachable Redis server is logged and startup continues.
 REDIS_ENABLE_AZURE_ENTRA_AUTH = os.getenv('REDIS_ENABLE_AZURE_ENTRA_AUTH', 'False').lower() == 'true'
+# Replace hostnames from CLUSTER SLOTS with the REDIS_URL hostname and keep each
+# shard's port. Azure Managed Redis advertises IP addresses, while the TLS
+# certificate is for the public hostname. Shard ports (for example 8500) must stay
+# as the cluster reported them. Leave this off when the advertised addresses are
+# already the ones clients should dial.
+REDIS_CLUSTER_REMAP_HOSTNAME = os.getenv('REDIS_CLUSTER_REMAP_HOSTNAME', 'False').lower() == 'true'
 
 REDIS_KEY_PREFIX = os.getenv('REDIS_KEY_PREFIX', 'open-webui')
 
